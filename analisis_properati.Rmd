@@ -1,0 +1,332 @@
+---
+title: "Análisis de la base de datos de properati 2022"
+output:
+  html_document:
+    df_print: paged
+    theme: "united"
+    code_folding: hide
+    fig_caption: true
+    fontsize: 24pt
+    fonttheme: structurebold
+    fontfamily: helvetica
+editor_options: 
+  chunk_output_type: console
+---
+
+## Analisis descriptivo
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+library(tidyverse)
+
+df = read_csv("C:/Users/kevin/OneDrive/Escritorio/analisis-properati/ar_properties_2022.csv") # carga de datos
+
+# --- Box plot precio segun barrio de CABA ---
+
+df.venta_caba = df %>%
+  filter(
+    operation_type == "Venta" &
+    currency == "USD" &
+    l1 == "Argentina" &
+    l2 == "Capital Federal" &
+    surface_covered > 0
+  ) %>%
+  select(property_type, l3, surface_covered, price) %>%
+  na.omit() %>%
+  mutate(price_m2 = price/surface_covered)
+
+ggplot(df.venta_caba, aes(l3, price_m2, fill=l3)) + geom_boxplot(outlier.shape = NA) + labs(title="Distribución de precio según barrios de CABA", x= "", y= "Precio por metro cuadrado (USD)") +
+  coord_cartesian(ylim = c(0,8000)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(legend.position = "none")
+
+# --- Histograma precio por metro cuadrado en CABA ---
+
+ggplot(df.venta_caba, aes(x = price_m2)) +
+  geom_histogram(binwidth = 200, position = "identity", fill = "#7ba3cc", colour="black") +
+  coord_cartesian(xlim = c(0,9000)) +
+  scale_x_continuous(breaks = seq(0,9000,1000)) +
+  labs(title = "Histograma precio por metro cuadrado en CABA", x = "Precio por metro cuadrado (USD)", y = "Frecuencia")
+
+# --- Bar plot tipo de propiedad segun principales provincias ---
+
+# filtro por provincia
+df.provincia = df %>%
+  filter(
+    operation_type == "Venta" &
+    currency == "USD" &
+    l1 == "Argentina"
+  ) %>%
+  select(property_type, l2) %>%
+  na.omit()
+
+# guardo la cantidad por provincia
+df.provincia.cantidad = df.provincia %>%
+  group_by(l2) %>%
+  summarise(total_por_provincia = n())
+
+# agrupo por provincia y tipo de propiedad
+df.provincia.tipo_propiedad = df.provincia %>%
+  group_by(property_type, l2) %>%
+  summarise(cantidad = n()) %>%
+  merge(df.provincia.cantidad, by = c("l2")) %>% # Agrego total_por_provincia
+  filter(total_por_provincia > 500) %>% # Me quedo con las provincias principales
+  mutate(Porcentaje = cantidad*100/total_por_provincia) # Agrego porcentaje de tipo de propiedad segun provincia
+
+ggplot(df.provincia.tipo_propiedad, aes(x = l2, y = Porcentaje, fill = property_type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.5)) +
+  theme_classic() +
+  labs(x = "", y = "Porcentaje", fill = "Tipo de propiedad") +
+  ggtitle("Tipo de propiedad segun principales provincias") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+# --- Box plot superficie segun tipo de propiedad ---
+
+df.provincia = df %>%
+  filter(
+    operation_type == "Venta" &
+    currency == "USD" &
+    l1 == "Argentina" &
+    surface_covered > 0 &
+    surface_total >= surface_covered
+  ) %>%
+  select(property_type, l2, surface_covered, surface_total) %>%
+  na.omit()
+
+ggplot(df.provincia, aes(property_type, surface_covered, fill=property_type)) + geom_boxplot(outlier.shape = NA) + labs(title="Distribución de superficie cubierta según tipo de propiedad", x= "", y= "Superficie (m2)")+
+  coord_cartesian(ylim = c(0,1500)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(legend.position = "none")
+
+ggplot(df.provincia, aes(property_type, surface_total, fill=property_type)) + geom_boxplot(outlier.shape = NA) + labs(title="Distribución de superficie total según tipo de propiedad", x= "", y= "Superficie (m2)")+
+  coord_cartesian(ylim = c(0,1500)) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  theme(legend.position = "none")
+
+```
+
+## Analisis espacial del precio del metro cuadrado de los departamentos de caba
+
+```{r out.width="100%", warning=FALSE, message=FALSE}
+
+df.geo = df %>%
+  filter(
+    property_type == "Departamento" &
+    operation_type == "Venta" &
+    currency == "USD" &
+    l1 == "Argentina" &
+    l2 == "Capital Federal" &
+    surface_covered > 0 & 
+    surface_total >= surface_covered
+  ) %>%
+  select(l3, surface_total, price, lat, lon) %>%
+  na.omit() %>%
+  mutate(price_m2 = price/surface_total)
+
+attach(df.geo) # pongo las variables en memoria
+
+ggplot(df.geo, aes(lon, lat)) + geom_point()
+
+```
+
+### Veamos superponiendo los puntos sobre el mapa
+
+```{r out.width="100%", warning=FALSE, message=FALSE}
+
+library(leaflet)
+
+leaflet() %>% addTiles() %>%
+  addCircleMarkers(lng=lon, lat=lat, fillOpacity=0.5, radius=3/2,stroke=FALSE)
+
+```
+
+### Determino el precio de cada departamento acorde a los vecinos más cercanos.
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+# La idea es calcular el precio mediano de los vecinos mas cercanos. El mediano para tener una medida robusta.
+
+library(nabor)
+
+cant_vecinos = 800
+N = nrow(df.geo) # cant de deptos
+coordenadas = cbind(lon, lat) # matriz de coordenadas
+vecinos = knn(coordenadas, coordenadas, k=cant_vecinos)$nn.idx # busca vecinos mas cercanos
+precio_mediano_vecinos = rep(NA, N) # inicializo variable que va a tener el precio mediano de los vecinos mas cercanos
+for (i in 1:N) {
+  precio_vecinos = price_m2[vecinos[i,]] # precio de vecinos cercanos por fila
+  precio_mediano_vecinos[i] = median(precio_vecinos) # para cada depto queda el precio mediano de sus vecinos
+}
+
+```
+
+```{r out.width="100%", warning=FALSE, message=FALSE}
+library(raster)
+
+ras = raster(nrows=50, ncols=50, xmn=min(lon), xmx=max(lon), ymn=min(lat), ymx=max(lat)) # raster vacio
+colores = c('orange', 'blue', 'green') # paleta de colores
+at = seq(min(precio_mediano_vecinos), max(precio_mediano_vecinos), length.out = 12) # puntos de corte de categorias
+cb = colorBin(palette = colores, bins = at, domain = at, na.color='#00000000') # colores
+ras.pm2 = rasterize(coordenadas, ras, field=precio_mediano_vecinos, fun=mean) # raster de valores promedios
+
+leaflet() %>% addTiles() %>% addRasterImage(ras.pm2, opacity=0.75, colors = cb) %>% addLegend(pal=cb, values = at, title = "Precio por metro cuadrado (USD)")
+
+```
+
+## Modelos predictivos
+
+```{r out.width="100%", warning=FALSE}
+
+# Preparo dataset para entrenar el modelo
+
+df.model = df %>%
+  filter(
+    property_type == "Departamento" &
+    operation_type == "Venta" &
+    currency == "USD" &
+    l1 == "Argentina" &
+    l2 == "Capital Federal" &
+    !is.na(l3) &
+    surface_covered > 0 &
+    surface_total >= surface_covered &
+    rooms >= bedrooms
+  ) %>%
+  # le agrego el dplyr:: para que no se confunda con el select() de otro paquete
+  dplyr::select(
+    superficie_cubierta = surface_covered,
+    surface_total, # esta variable va a ser reemplazada por la variable fondo
+    precio = price,
+    ambientes = rooms,
+    banos = bathrooms,
+    habitaciones = bedrooms,
+    lat,
+    lon) %>%
+  na.omit() %>%
+  mutate(fondo = surface_total - superficie_cubierta) %>%
+  mutate(precio_m2 = precio/surface_total) %>%
+  # el precio por metro cuadrado debe tener aprox min 750 y max 9.000
+  filter(precio_m2 > 750 & precio_m2 < 9000) %>%
+  # saco superficie total del data frame y saco precio por metro cuadrado
+  dplyr::select(-surface_total, -precio_m2)
+
+```
+
+```{r out.width="100%", warning=FALSE}
+
+# Analizo el poder de prediccion de un modelo con regresion lineal y otro modelo con random forest
+
+formula = precio ~ lat + lon + superficie_cubierta + fondo + ambientes + banos + habitaciones # TODO: Probar con otras formulas
+
+set.seed(123) # fijo semilla para reproducir el mismo ejemplo
+
+# Particiono con datos de entrenamiento y de prueba indicando proporción
+sample <- sample(c(TRUE, FALSE), nrow(df.model), replace=TRUE, prob=c(0.70,0.3)) # 70% entrenamiento, 30% prueba
+train_data <- df.model[sample,] # datos de entrenamiento
+test_data <- df.model[!sample,] # datos de prueba
+
+df.poder_predictivo = data.frame(matrix(ncol = 3, nrow = 0)) # creo dataframe vacio donde voy a evaluar el poder de prediccion de cada modelo
+colnames(df.poder_predictivo) = c("MAE", "RMSE", "Rsquared") # le pongo nombres a las columnas
+
+```
+
+### Veamos las métricas del modelo con regresión lineal y el modelo con random forest
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+library(caret)
+
+# Armo modelo con regresion lineal
+
+test_model.lm = lm(formula, data = train_data) # entreno modelo con regresion lineal
+predict_precios.lm = predict(test_model.lm, test_data) # guardo los precios que predice
+metrics.lm = postResample(pred = predict_precios.lm, obs = test_data$precio) # chequeo diferencia entre el precio predicho y el original usando el paquete caret para obtener "MAE", "RMSE", "Rsquared"
+metrics.lm = t(data.frame(metrics.lm)) # lo paso a dataframe y transpongo filas con columnas
+df.poder_predictivo = rbind(df.poder_predictivo, metrics.lm) # sumo modelo a dataframe de poder de prediccion
+
+```
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+library(randomForest)
+
+# Armo modelo con random forest
+
+test_model.rf = randomForest(formula, data = train_data) # entreno modelo con random forest
+predict_precios.rf = predict(test_model.rf, test_data) # guardo los precios que predice
+metrics.rf = postResample(pred = predict_precios.rf, obs = test_data$precio) # chequeo diferencia entre el precio predicho y el original usando el paquete caret para obtener "MAE", "RMSE", "Rsquared"
+metrics.rf = t(data.frame(metrics.rf)) # lo paso a dataframe y transpongo filas con columnas
+df.poder_predictivo = rbind(df.poder_predictivo, metrics.rf) # sumo modelo a tabla de poder de prediccion
+
+```
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+df.poder_predictivo
+
+```
+
+### Parece que el modelo que usa random forest predice mejor el precio.
+
+### Veamos como predice el precio de estos dos departamentos que piden cotizacion:
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+# Boyaca y Ravignani son las calles de cada depto
+df.nuevo_depto.boyaca = data.frame(superficie_cubierta = 60, fondo = 10, lat = -34.6226641, lon = -58.4622173, ambientes = 3, banos = 1, habitaciones = 2)
+df.nuevo_depto.ravignani = data.frame(superficie_cubierta = 40, fondo = 3, lat = -34.5840994, lon = -58.444368, ambientes = 1, banos = 1, habitaciones = 1)
+
+# Muestro deptos de boyaca y ravignani previo a predecir precio
+rbind(df.nuevo_depto.boyaca, df.nuevo_depto.ravignani)
+
+# Genero modelo de regresion lineal y random forest con toda la informacion
+model.lm = lm(formula, data = df.model) # modelo con regresion lineal
+model.rf = randomForest(formula, data = df.model) # modelo con random forest
+
+#Agrego las predicciones de precios
+df.nuevo_depto.boyaca$precio.lm = predict(model.lm, df.nuevo_depto.boyaca)
+df.nuevo_depto.boyaca$precio.rf = predict(model.rf, df.nuevo_depto.boyaca)
+df.nuevo_depto.ravignani$precio.lm = predict(model.lm, df.nuevo_depto.ravignani)
+df.nuevo_depto.ravignani$precio.rf = predict(model.rf, df.nuevo_depto.ravignani)
+
+# Muestro deptos de boyaca y ravignani con los precios segun cada modelo
+rbind(df.nuevo_depto.boyaca, df.nuevo_depto.ravignani)
+
+```
+
+### Explicacion del modelo con BreakDown
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+library(DALEX)
+
+# Voy a explicar la prediccion del modelo que usa random forest
+explain_rf <- DALEX::explain(model = model.rf,  
+                        data = df.model[,-2],
+                           y = df.model$precio,
+                        label = "")
+
+explain_rf %>% model_parts() %>% plot(show_boxplots = FALSE) + ggtitle("Importancia de cada variable", "")
+
+```
+
+```{r out.width="100%", message=FALSE, warning=FALSE}
+
+# Veo como juega cada variable del modelo con la prediccion de boyaca
+bd_boyaca_rf <- predict_parts(explainer = explain_rf,
+                 new_observation = df.nuevo_depto.boyaca,
+                 order = c("lat","lon","superficie_cubierta","fondo", "ambientes", "banos", "habitaciones"),
+                 type = "break_down")
+
+plot(bd_boyaca_rf) + ggtitle("Prediccion de boyaca", "Aporte de cada variable en la prediccion del precio")
+
+# Veo como juega cada variable del modelo con la prediccion de ravignani
+bd_ravignani_rf <- predict_parts(explainer = explain_rf,
+                 new_observation = df.nuevo_depto.ravignani,
+                 order = c("lat","lon","superficie_cubierta","fondo", "ambientes", "banos", "habitaciones"),
+                 type = "break_down")
+
+plot(bd_ravignani_rf) + ggtitle("Prediccion de ravignani", "Aporte de cada variable en la prediccion del precio")
+
+```
